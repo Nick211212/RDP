@@ -1,0 +1,305 @@
+name: RDP with Enhanced Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Session duration (minutes)'
+        required: true
+        default: '120'
+        type: choice
+        options:
+          - '60'
+          - '120'
+          - '180'
+          - '240'
+
+jobs:
+  enhanced-rdp:
+    runs-on: windows-latest
+    timeout-minutes: ${{ github.event.inputs.duration }}
+    
+    steps:
+      - name: Check Available Resources
+        run: |
+          Write-Host "=== SYSTEM RESOURCES ==="
+          
+          # Check RAM
+          $memory = Get-CimInstance Win32_OperatingSystem
+          $totalMemoryGB = [math]::Round($memory.TotalVisibleMemorySize/1MB, 2)
+          $freeMemoryGB = [math]::Round($memory.FreePhysicalMemory/1MB, 2)
+          Write-Host "Total RAM: ${totalMemoryGB}GB"
+          Write-Host "Free RAM: ${freeMemoryGB}GB"
+          
+          # Check Disk Space
+          $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+          $totalDiskGB = [math]::Round($disk.Size/1GB, 2)
+          $freeDiskGB = [math]::Round($disk.FreeSpace/1GB, 2)
+          Write-Host "Total Disk: ${totalDiskGB}GB"
+          Write-Host "Free Disk: ${freeDiskGB}GB"
+          
+          # Check CPU
+          $cpu = Get-CimInstance Win32_Processor
+          Write-Host "CPU: $($cpu.Name)"
+          Write-Host "Cores: $($cpu.NumberOfCores)"
+          Write-Host "Threads: $($cpu.NumberOfLogicalProcessors)"
+          
+          Write-Host "========================="
+          
+          # Note about GitHub runner limits
+          Write-Host "`nNote: GitHub-hosted Windows runners have ~7GB RAM and 14GB SSD."
+          Write-Host "For 16GB RAM/500GB storage, use self-hosted runners or cloud services."
+
+      - name: Configure RDP Settings
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Optimize RDP for performance
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          
+          # Configure for better performance
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MaxInstanceCount" -Value 4294967295
+          
+          # Disable wallpaper for better performance
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' `
+                           -Name "fNoRemoteDesktopWallpaper" -Value 1 -Force
+          
+          # Configure firewall
+          netsh advfirewall firewall delete rule name="GitHub-RDP" 2>$null
+          netsh advfirewall firewall add rule name="GitHub-RDP" `
+            dir=in action=allow protocol=TCP localport=3389
+          
+          # Restart service
+          Restart-Service TermService -Force
+          Write-Host "RDP configured for optimal performance"
+
+      - name: Create RDP User
+        run: |
+          # Generate secure password
+          Add-Type -AssemblyName System.Web
+          $password = [System.Web.Security.Membership]::GeneratePassword(16, 4)
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create user
+          $username = "GitHubRDP"
+          try {
+            if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $securePassword `
+                -AccountNeverExpires -PasswordNeverExpires -FullName "GitHub RDP User"
+            } else {
+              Set-LocalUser -Name $username -Password $securePassword
+            }
+            
+            # Add to groups
+            Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+            
+            # Enable user
+            Enable-LocalUser -Name $username
+            
+            # Store credentials
+            echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+            echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+            
+            Write-Host "User '$username' created successfully"
+          } catch {
+            Write-Error "Failed to create user: $_"
+            exit 1
+          }
+
+      - name: Optimize System Performance
+        run: |
+          Write-Host "Optimizing system performance for RDP..."
+          
+          # Set power plan to high performance
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  # High performance GUID
+          
+          # Disable visual effects for better performance
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+                           -Name "VisualFXSetting" -Value 2 -Force
+          
+          # Optimize page file (virtual memory)
+          $pageFile = Get-CimInstance Win32_PageFileSetting
+          if ($pageFile) {
+            $pageFile.Delete()
+          }
+          
+          # Set page file to system managed on C: drive
+          $computersys = Get-WmiObject -Class Win32_ComputerSystem -EnableAllPrivileges
+          $computersys.AutomaticManagedPagefile = $true
+          $computersys.Put()
+          
+          # Clear temp files
+          Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "$env:WINDIR\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          
+          Write-Host "System optimization completed"
+
+      - name: Install Essential Software
+        run: |
+          Write-Host "Installing essential software..."
+          
+          # Create software directory
+          $softwareDir = "C:\Software"
+          New-Item -ItemType Directory -Path $softwareDir -Force | Out-Null
+          
+          # Install Chrome
+          $chromeUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+          $chromePath = "$softwareDir\chrome_installer.exe"
+          Invoke-WebRequest -Uri $chromeUrl -OutFile $chromePath -UseBasicParsing
+          Start-Process -FilePath $chromePath -ArgumentList "/silent /install" -Wait -NoNewWindow
+          
+          # Install 7-Zip
+          $7zipUrl = "https://www.7-zip.org/a/7z2407-x64.exe"
+          $7zipPath = "$softwareDir\7z-installer.exe"
+          Invoke-WebRequest -Uri $7zipUrl -OutFile $7zipPath -UseBasicParsing
+          Start-Process -FilePath $7zipPath -ArgumentList "/S" -Wait -NoNewWindow
+          
+          # Install VS Code
+          $vscodeUrl = "https://code.visualstudio.com/sha/download?build=stable&os=win32-x64"
+          $vscodePath = "$softwareDir\vscode.exe"
+          Invoke-WebRequest -Uri $vscodeUrl -OutFile $vscodePath -UseBasicParsing
+          Start-Process -FilePath $vscodePath -ArgumentList "/verysilent /mergetasks=!runcode" -Wait -NoNewWindow
+          
+          # Install Git
+          $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.45.1.windows.1/Git-2.45.1-64-bit.exe"
+          $gitPath = "$softwareDir\git.exe"
+          Invoke-WebRequest -Uri $gitUrl -OutFile $gitPath -UseBasicParsing
+          Start-Process -FilePath $gitPath -ArgumentList "/VERYSILENT /NORESTART /NOCANCEL /SP- /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /COMPONENTS=""icons,ext\reg\shellhere,assoc,assoc_sh""" -Wait -NoNewWindow
+          
+          Write-Host "Essential software installed"
+
+      - name: Configure Development Environment
+        run: |
+          Write-Host "Configuring development environment..."
+          
+          # Set environment variables
+          [Environment]::SetEnvironmentVariable("GITHUB_ACTIONS_RDP", "1", "Machine")
+          
+          # Create workspace directory
+          $workspace = "C:\Workspace"
+          New-Item -ItemType Directory -Path $workspace -Force | Out-Null
+          
+          # Create README with connection info
+          $readmeContent = @"
+# GitHub RDP Workspace
+
+This is a temporary RDP workspace created by GitHub Actions.
+
+## Available Software
+- Chrome Browser
+- Visual Studio Code
+- Git
+- 7-Zip
+- PowerShell 7+
+
+## Storage Information
+Note: GitHub-hosted runners have limited storage (~14GB).
+For larger storage requirements, consider:
+1. Self-hosted runners with custom hardware
+2. Cloud services (AWS, Azure, GCP)
+3. Mounting network drives
+
+## Connection Information
+- Username: $env:RDP_USERNAME
+- Password: (Check GitHub Actions logs)
+- Session Duration: ${{ github.event.inputs.duration }} minutes
+
+## Tips
+1. Save your work frequently
+2. Upload important files to GitHub
+3. The session will terminate automatically
+"@
+          
+          Set-Content -Path "$workspace\README.md" -Value $readmeContent
+          
+          # Clone your repository (optional)
+          # git clone https://github.com/yourusername/yourrepo.git "$workspace\project"
+          
+          Write-Host "Development environment ready"
+
+      - name: Get Public IP for RDP
+        run: |
+          # Note: GitHub runners don't have public IPs for RDP
+          # This is for educational purposes
+          Write-Host "Getting network information..."
+          
+          # Get local IP
+          $localIP = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet*" | Where-Object {$_.PrefixOrigin -eq 'Dhcp'}).IPAddress
+          if (-not $localIP) {
+            $localIP = "Not available (behind NAT)"
+          }
+          
+          echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
+          
+          Write-Host "Local IP: $localIP"
+          Write-Host "`nImportant: GitHub runners are behind NAT and not publicly accessible"
+          Write-Host "For external RDP access, you need:"
+          Write-Host "1. Self-hosted runner with public IP"
+          Write-Host "2. VPN solution (Tailscale, ZeroTier)"
+          Write-Host "3. Cloud VM with RDP enabled"
+
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════════════════╗"
+          Write-Host "║                    RDP SESSION READY                         ║"
+          Write-Host "╠══════════════════════════════════════════════════════════════╣"
+          Write-Host "║                                                              ║"
+          Write-Host "║  ⚠️  IMPORTANT: This runner is NOT publicly accessible      ║"
+          Write-Host "║                                                              ║"
+          Write-Host "║  To access this RDP session, you need to:                    ║"
+          Write-Host "║  1. Set up a self-hosted GitHub runner                       ║"
+          Write-Host "║  2. Configure proper networking/VPN                          ║"
+          Write-Host "║  3. Ensure firewall allows RDP (port 3389)                   ║"
+          Write-Host "║                                                              ║"
+          Write-Host "║  GitHub-hosted runners are for CI/CD, not remote desktop     ║"
+          Write-Host "║                                                              ║"
+          Write-Host "║  Username: $env:RDP_USERNAME                                 ║"
+          Write-Host "║  Password: $env:RDP_PASSWORD                                 ║"
+          Write-Host "║  Duration: ${{ github.event.inputs.duration }} minutes       ║"
+          Write-Host "║                                                              ║"
+          Write-Host "╚══════════════════════════════════════════════════════════════╝"
+          Write-Host ""
+          
+          Write-Host "Alternative solutions for 16GB RAM / 500GB storage:"
+          Write-Host "1. AWS EC2 (t3.xlarge: 16GB RAM, variable storage)"
+          Write-Host "2. Azure Virtual Machine (Standard_D4s_v3: 16GB RAM)"
+          Write-Host "3. Google Cloud Compute Engine (n2-standard-4: 16GB RAM)"
+          Write-Host "4. Self-hosted runner on your own hardware"
+
+      - name: Keep Session Alive
+        run: |
+          Write-Host "RDP session configured. Keeping runner alive..."
+          Write-Host "Session will auto-terminate after ${{ github.event.inputs.duration }} minutes"
+          Write-Host "Cancel workflow manually to stop earlier"
+          
+          $duration = [int]${{ github.event.inputs.duration }}
+          $endTime = (Get-Date).AddMinutes($duration)
+          
+          while ((Get-Date) -lt $endTime) {
+            $remaining = $endTime - (Get-Date)
+            $minutes = [math]::Round($remaining.TotalMinutes, 1)
+            
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - $minutes minutes remaining"
+            
+            # Simulate activity to prevent timeout
+            # You could add actual tasks here
+            if ($minutes % 5 -eq 0) {
+              # Check system resources periodically
+              $memory = Get-CimInstance Win32_OperatingSystem
+              $freeMemoryGB = [math]::Round($memory.FreePhysicalMemory/1MB, 2)
+              $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+              $freeDiskGB = [math]::Round($disk.FreeSpace/1GB, 2)
+              
+              Write-Host "  Free RAM: ${freeMemoryGB}GB | Free Disk: ${freeDiskGB}GB"
+            }
+            
+            Start-Sleep -Seconds 60
+          }
+          
+          Write-Host "Session time limit reached. Shutting down..."
